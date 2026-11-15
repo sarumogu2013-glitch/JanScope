@@ -29,6 +29,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <commdlg.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -270,6 +271,64 @@ static Child* Running(UINT fn) {
     return nullptr;
 }
 
+static std::vector<DWORD> Leftovers(const std::wstring& exe, DWORD exceptPid) {
+    std::vector<DWORD> out;
+    std::wstring want = InDir(exe);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        if (_wcsicmp(pe.szExeFile, exe.c_str()) != 0 || pe.th32ProcessID == exceptPid) continue;
+        bool mine = std::any_of(g_children.begin(), g_children.end(), [&](const Child& c) { return c.pid == pe.th32ProcessID; });
+        if (mine) continue;
+        // 同じフォルダの exe だけ（別の場所の JanScope は触らない）
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        if (!h) continue;
+        wchar_t path[MAX_PATH * 2];
+        DWORD n = MAX_PATH * 2;
+        if (QueryFullProcessImageNameW(h, 0, path, &n) && _wcsicmp(path, want.c_str()) == 0) out.push_back(pe.th32ProcessID);
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    return out;
+}
+
+// ---- 窓のない子（サーバー・メディアサーバー）----
+// ログはランチャーの中に出すので窓がない。ランチャーを閉じたら（落ちたときも）一緒に止まるよう、ジョブに入れる
+static HANDLE g_job = nullptr;
+static HANDLE Job() {
+    if (!g_job) {
+        g_job = CreateJobObjectW(nullptr, nullptr);
+        if (g_job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &info, sizeof(info));
+        }
+    }
+    return g_job;
+}
+
+/// このフォルダの exe（janscope-server.exe など）で、ランチャーが起動したもの以外に動いているもの
+static std::vector<DWORD> Leftovers(const std::wstring& exe, DWORD exceptPid = 0);
+
+/// 前に起動して残っているもの（ランチャーを閉じても止まらなかった古い版など）を、聞いてから止める。止めたら（なければ）true
+static bool StopLeftovers(const std::wstring& exe, const std::wstring& title) {
+    std::vector<DWORD> pids = Leftovers(exe);
+    if (pids.empty()) return true;
+    std::wstring q = L"前に起動した" + title + L"が残っています（ランチャーを閉じても止まらずに動いていたもの）。\n止めてから起動し直しますか？\n\n「いいえ」なら起動しません（ポートが使われたままなので起動できません）。";
+    if (MessageBoxW(g_main, q.c_str(), L"JanScope", MB_YESNO | MB_ICONQUESTION) != IDYES) return false;
+    for (DWORD pid : pids) {
+        if (HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid)) {
+            TerminateProcess(h, 0);
+            WaitForSingleObject(h, 3000);
+            CloseHandle(h);
+        }
+    }
+    Sleep(300);
+    return true;
+}
+
 /// 子の出力を読んで、メインウィンドウのサーバーログに送る（別スレッド）
 static void ReadOutput(HANDLE rd, HWND hwnd, std::string prefix, std::string endMsg) {
     char buf[4096];
@@ -327,6 +386,8 @@ static Child* Launch(UINT fn, const std::wstring& title, const std::wstring& exe
     }
     CloseHandle(pi.hThread);
     if (capture) {
+        // 窓がないので、ランチャーと一緒に止まるようにする（ランチャーが落ちても止まる）
+        if (HANDLE j = Job()) AssignProcessToJobObject(j, pi.hProcess);
         CloseHandle(wr);
         HWND hwnd = g_main;
         std::string endMsg = prefix + "（" + std::string(fn == ID_MEDIA ? "メディアサーバー" : "サーバー") + "が終了しました）";
@@ -757,6 +818,7 @@ static void StartServer(bool resume, bool dummy = false, const std::wstring& dum
     if (!dummyFile.empty()) args += L" --dummy-file \"" + dummyFile + L"\"";
     else if (dummy) args += L" --dummy";
     dummy = dummy || !dummyFile.empty();
+    if (!StopLeftovers(L"janscope-server.exe", L"サーバー")) return;
     // サーバーの出力（接続コード・ログ）はメインウィンドウのサーバーログに出す
     std::wstring title = dummy ? L"サーバー（ダミー対局データ）" : resume ? L"サーバー（再開）" : L"サーバー";
     g_logUsed = true;
@@ -811,6 +873,7 @@ static void StartClient(UINT fn, const std::wstring& dummyFile = L"", bool withO
 /// メディアサーバー: カメラ（RTMP・Webカメラ）・画像・映像を受けて、映像サンドボックスの枠で切り出し、入力担当に渡す。
 /// ログはサーバーログの欄に「[メディア]」を付けて出す。入力担当・サーバーを起動し直してもカメラは切れない
 static void StartMedia() {
+    if (!StopLeftovers(L"janscope-media.exe", L"メディアサーバー")) return;
     CreateDirectoryW(InDir(L"data").c_str(), nullptr);
     g_logUsed = true;
     std::wstring args = L"--data \"" + InDir(L"data") + L"\"";
@@ -1692,8 +1755,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
         case WM_CLOSE:
             if (!g_children.empty() &&
-                MessageBoxW(h, std::any_of(g_children.begin(), g_children.end(), [](const Child& c) { return c.embedded != nullptr; }) ? L"このウィンドウの中の操作画面（と出力ウィンドウ）も閉じます。サーバーなど別のウィンドウのものは動いたままです。\n閉じますか？"
-                                          : L"起動したもの（サーバー・クライアントなど）は動いたままになります。\nランチャーだけ閉じますか？",
+                MessageBoxW(h,
+                            L"ランチャーを閉じると、サーバー・メディアサーバー（ログをこのウィンドウに出しているもの）と、このウィンドウの中の操作画面（と配信画面）も止まります。\n選手用画面など別のウィンドウのものは動いたままです。\n\n配信中・対局中は閉じないでください。閉じますか？",
                             L"JanScope",
                             MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return 0;
