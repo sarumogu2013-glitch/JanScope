@@ -139,8 +139,8 @@ fn receive(l: TcpListener, bus: Arc<crate::Bus>, done: Arc<AtomicBool>) {
 pub fn run(src: SourceDef, st: Arc<State>, stop: Arc<AtomicBool>) {
     let feed = Arc::new(Mutex::new(Feed::default()));
     // RTMP: 受け口から届く FLV を覚えつつ、今の ffmpeg へ流す
-    if let SourceKind::Rtmp { app, key } = &src.kind {
-        let sub = st.rtmp.subscribe(app, key);
+    if let (SourceKind::Rtmp { app, key }, Some(rtmp)) = (&src.kind, &st.rtmp) {
+        let sub = rtmp.subscribe(app, key);
         let (f2, stop2, name) = (feed.clone(), stop.clone(), src.name.clone());
         std::thread::spawn(move || {
             // sub はこのスレッドが持つ（止まると受け口の登録も消える）
@@ -204,7 +204,8 @@ pub fn run(src: SourceDef, st: Arc<State>, stop: Arc<AtomicBool>) {
             receivers.push(std::thread::spawn(move || receive(l, bus, d)));
         }
         let args = ffmpeg_args(&src.kind, &ports);
-        let mut cmd = Command::new(&st.ffmpeg);
+        let ffmpeg = st.ffmpeg.lock().unwrap().clone();
+        let mut cmd = Command::new(&ffmpeg);
         cmd.args(&args)
             .stdin(if rtmp { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::null())
@@ -217,7 +218,7 @@ pub fn run(src: SourceDef, st: Arc<State>, stop: Arc<AtomicBool>) {
         let mut child: Child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let msg = format!("ffmpeg を起動できません（{}）: {e}", st.ffmpeg);
+                let msg = format!("ffmpeg を起動できません（{ffmpeg}）: {e}");
                 if st
                     .errors
                     .lock()

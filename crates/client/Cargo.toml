@@ -16,6 +16,8 @@ janscope-core.workspace = true
 janscope-netclient.workspace = true
 janscope-video.workspace = true
 janscope-update.workspace = true
+# この PC のファイル・Webカメラ・URL を、メディアサーバーを通さずに映像サンドボックスへ入れる
+janscope-media.workspace = true
 # --dummy-server: ダミー対局データ入りのサーバーをクライアントの中で動かす
 janscope-server.workspace = true
 tokio.workspace = true

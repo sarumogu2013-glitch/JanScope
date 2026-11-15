@@ -46,7 +46,7 @@ fn main() {
         now(),
         env!("CARGO_PKG_VERSION")
     );
-    match st.rtmp.status().bind_error {
+    match st.rtmp.as_ref().and_then(|r| r.status().bind_error) {
         Some(e) => println!("{} RTMP の受け口を開けません: {e}", now()),
         None => {
             let ip = janscope_video::rtmp_server::local_ip()

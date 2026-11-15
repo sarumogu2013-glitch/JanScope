@@ -1538,7 +1538,7 @@ fn face_settings_panel(
                                 .on_hover_text("配信元のサーバーの rtmp://... から受け取る");
                         });
                     if f.mode == RtmpMode::Media && before != RtmpMode::Media {
-                        f.url = crate::sandbox::face_url(&d.media_url, i as u8);
+                        f.url = crate::sandbox::face_url(i as u8);
                     }
                     if f.mode == RtmpMode::Media {
                         ui.weak("映像サンドボックスの「選手顔」の枠");

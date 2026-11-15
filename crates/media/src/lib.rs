@@ -34,13 +34,28 @@ pub struct State {
     pub buses: Mutex<HashMap<String, Arc<Bus>>>,
     /// ソースごとの最後のエラー
     pub errors: Mutex<HashMap<String, String>>,
-    pub rtmp: RtmpServer,
-    pub ffmpeg: String,
+    /// RTMP の受け口（入力担当の中のメディアでは持たない）
+    pub rtmp: Option<RtmpServer>,
+    pub ffmpeg: Mutex<String>,
     pub config_path: PathBuf,
+    /// 入力担当の中のメディア: RTMP などはメディアサーバー（この URL）から受ける窓口になる
+    pub upstream: Mutex<Option<String>>,
+    /// メディアサーバーの最後の様子（行き先を決めるのに使う。1秒ごとに取り直す）
+    pub upstream_status: Mutex<Option<Result<janscope_video::sandbox::MediaStatus, String>>>,
 }
 
 impl State {
+    /// メディアサーバー（RTMP の受け口つき）
     pub fn new(rtmp_port: u16, ffmpeg: String, config_path: PathBuf) -> Arc<State> {
+        Self::make(Some(RtmpServer::shared(rtmp_port)), ffmpeg, config_path)
+    }
+
+    /// 入力担当の中のメディア（この PC のファイル・Webカメラ・URL。RTMP はメディアサーバーから）
+    pub fn new_local(ffmpeg: String, config_path: PathBuf) -> Arc<State> {
+        Self::make(None, ffmpeg, config_path)
+    }
+
+    fn make(rtmp: Option<RtmpServer>, ffmpeg: String, config_path: PathBuf) -> Arc<State> {
         let mut config: SandboxConfig = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -51,10 +66,40 @@ impl State {
             version: AtomicU64::new(1),
             buses: Mutex::new(HashMap::new()),
             errors: Mutex::new(HashMap::new()),
-            rtmp: RtmpServer::shared(rtmp_port),
-            ffmpeg,
+            rtmp,
+            ffmpeg: Mutex::new(ffmpeg),
             config_path,
+            upstream: Mutex::new(None),
+            upstream_status: Mutex::new(None),
         })
+    }
+
+    /// メディアサーバーの最後の様子（つながっていれば）
+    pub fn upstream_ok(&self) -> Option<janscope_video::sandbox::MediaStatus> {
+        match &*self.upstream_status.lock().unwrap() {
+            Some(Ok(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// このソースはここ（この PC）で読み込んでいるか
+    pub fn is_local_source(&self, id: &str) -> bool {
+        self.config
+            .lock()
+            .unwrap()
+            .sources
+            .iter()
+            .any(|s| s.id == id)
+            || self.rtmp_sources().iter().any(|s| s.id == id)
+    }
+
+    /// この枠はここで切り出しているか
+    pub fn is_local_region(&self, role_id: &str) -> bool {
+        let cfg = self.config.lock().unwrap();
+        cfg.regions
+            .iter()
+            .any(|r| r.role.id() == role_id && cfg.sources.iter().any(|s| s.id == r.source))
+            || (self.rtmp.is_some() && cfg.regions.iter().any(|r| r.role.id() == role_id))
     }
 
     /// 名前の映像の通り道（なければ作る）
@@ -67,26 +112,45 @@ impl State {
             .clone()
     }
 
-    /// 今のソース（手で足したもの＋RTMP で届いているもの）
-    pub fn sources(&self) -> Vec<SourceDef> {
+    /// RTMP で届いているのに、設定にないソース
+    fn rtmp_sources(&self) -> Vec<SourceDef> {
+        let Some(rtmp) = &self.rtmp else {
+            return vec![];
+        };
         let cfg = self.config.lock().unwrap();
-        let mut v = cfg.sources.clone();
-        for p in self.rtmp.status().publishers {
-            let known = v.iter().any(|s| {
-                matches!(&s.kind, SourceKind::Rtmp { app, key } if *app == p.app && *key == p.key)
-            });
-            if !known {
-                v.push(SourceDef {
-                    id: format!("rtmp-{}", safe_id(&p.key)),
-                    name: format!("RTMP {}/{}", p.app, p.key),
-                    kind: SourceKind::Rtmp {
-                        app: p.app.clone(),
-                        key: p.key.clone(),
-                    },
-                });
-            }
-        }
+        rtmp.status()
+            .publishers
+            .into_iter()
+            .filter(|p| {
+                !cfg.sources.iter().any(|s| {
+                    matches!(&s.kind, SourceKind::Rtmp { app, key } if *app == p.app && *key == p.key)
+                })
+            })
+            .map(|p| SourceDef {
+                id: format!("rtmp-{}", safe_id(&p.key)),
+                name: format!("RTMP {}/{}", p.app, p.key),
+                kind: SourceKind::Rtmp {
+                    app: p.app.clone(),
+                    key: p.key.clone(),
+                },
+                enabled: true,
+            })
+            .collect()
+    }
+
+    /// 一覧に出すソース（読み込みを止めたものも含む）
+    pub fn all_sources(&self) -> Vec<SourceDef> {
+        let mut v = self.config.lock().unwrap().sources.clone();
+        v.extend(self.rtmp_sources());
         v
+    }
+
+    /// 読み込むソース（手で足したもの＋RTMP で届いているもの。止めたものは除く）
+    pub fn sources(&self) -> Vec<SourceDef> {
+        self.all_sources()
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect()
     }
 
     /// 設定を差し替えて保存する（ffmpeg は起動し直される）

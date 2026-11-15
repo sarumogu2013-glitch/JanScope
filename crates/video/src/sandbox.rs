@@ -95,6 +95,13 @@ pub struct SourceDef {
     pub id: String,
     pub name: String,
     pub kind: SourceKind,
+    /// 読み込む（false なら一覧に残したまま読み込みを止める）
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// 枠の使い道
@@ -228,6 +235,10 @@ impl SandboxConfig {
 #[serde(default)]
 pub struct MediaStatus {
     pub version: String,
+    /// 入力担当の中のメディア（この PC のファイル・Webカメラ）が、メディアサーバー（RTMP）の窓口も兼ねているとき、その場所
+    pub upstream: Option<String>,
+    /// メディアサーバーにつながらないとき
+    pub upstream_error: Option<String>,
     pub rtmp_port: u16,
     pub rtmp_error: Option<String>,
     pub sources: Vec<SourceStatus>,
@@ -249,6 +260,44 @@ pub struct SourceStatus {
     pub error: Option<String>,
     /// 手で足したソースか（RTMP の自動は false）
     pub configured: bool,
+    /// 読み込んでいるか
+    pub enabled: bool,
+    /// どこで読み込んでいるか（「この PC」＝入力担当の中、「メディアサーバー」）
+    pub origin: String,
+    /// ファイルの場所・デバイス名・URL・RTMP のキー
+    pub detail: String,
+}
+
+/// 入力担当の中のメディア（この PC のファイル・Webカメラ）の HTTP の場所（起動したら入る）
+pub static LOCAL_MEDIA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 顔カメラなどの URL の `local:` を、入力担当の中のメディアの場所に直す
+pub fn resolve_local(url: &str) -> Result<String, String> {
+    match url.strip_prefix("local:") {
+        Some(rest) => LOCAL_MEDIA
+            .get()
+            .map(|b| {
+                format!(
+                    "{}/{}",
+                    b.trim_end_matches('/'),
+                    rest.trim_start_matches('/')
+                )
+            })
+            .ok_or_else(|| "この PC のサンドボックスが動いていません".to_string()),
+        None => Ok(url.to_string()),
+    }
+}
+
+impl SourceKind {
+    /// 一覧に出す中身（ファイルの場所など）
+    pub fn detail(&self) -> String {
+        match self {
+            SourceKind::Rtmp { app, key } => format!("rtmp://…/{app}/{key}"),
+            SourceKind::Webcam { device } => device.clone(),
+            SourceKind::Image { path } | SourceKind::Video { path } => path.clone(),
+            SourceKind::Url { url } => url.clone(),
+        }
+    }
 }
 
 /// ソースの id に使える文字だけにする

@@ -251,7 +251,10 @@ fn main() {
     } else {
         app.add_plugins(EguiPlugin::default())
             .init_resource::<operator::OperatorUi>()
-            .add_systems(Startup, face::setup_face)
+            .add_systems(
+                Startup,
+                (sandbox::start_local_media, face::setup_face).chain(),
+            )
             .add_systems(
                 Startup,
                 move |c: Commands, s: ResMut<EguiGlobalSettings>| {

@@ -22,13 +22,37 @@ use janscope_video::{MjpegSplitter, RtmpMode, http};
 use crate::config::{ClientConfig, FaceOutput};
 use crate::face::FaceRuntime;
 
-/// 選手顔（席 seat）の切り出し映像の URL
-pub fn face_url(media_url: &str, seat: u8) -> String {
-    format!(
-        "{}/region/{}.mjpg",
-        media_url.trim_end_matches('/'),
-        RegionRole::Face(seat).id()
-    )
+/// 選手顔（席 seat）の切り出し映像の URL（この PC のサンドボックス。メディアサーバーの枠なら取り次ぐ）
+pub fn face_url(seat: u8) -> String {
+    format!("local:region/{}.mjpg", RegionRole::Face(seat).id())
+}
+
+/// 入力担当の中のメディア（この PC のファイル・Webカメラ・URL。RTMP はメディアサーバーから取り次ぐ）
+#[derive(Resource, Clone)]
+pub struct LocalMedia(pub Arc<janscope_media::State>);
+
+/// 入力担当の中のメディアを起動する（設定は入力担当の設定ファイルの隣の janscope-sandbox.json）
+pub fn start_local_media(mut commands: Commands, cfg: Res<ClientConfig>) {
+    let dir = crate::config::config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let st =
+        janscope_media::State::new_local(cfg.ffmpeg.clone(), dir.join("janscope-sandbox.json"));
+    *st.upstream.lock().unwrap() = Some(cfg.media_url.clone());
+    match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => {
+            if let Ok(a) = l.local_addr() {
+                let _ = janscope_video::sandbox::LOCAL_MEDIA.set(format!("http://{a}"));
+            }
+            let (s1, s2, s3) = (st.clone(), st.clone(), st.clone());
+            std::thread::spawn(move || janscope_media::pipeline::manage(s1));
+            std::thread::spawn(move || janscope_media::http_api::poll_upstream(s2));
+            std::thread::spawn(move || janscope_media::http_api::serve(l, s3));
+            commands.insert_resource(LocalMedia(st));
+        }
+        Err(e) => warn!("この PC のサンドボックスを起動できません: {e}"),
+    }
 }
 
 /// ソースの見せ方（軽くするため選べる）
@@ -258,8 +282,22 @@ pub fn sandbox_ui(
     mut sb: ResMut<SandboxUi>,
     mut cfg: ResMut<ClientConfig>,
     mut face: ResMut<FaceRuntime>,
+    local: Option<Res<LocalMedia>>,
 ) -> Result {
     let sb = &mut *sb;
+    // この PC のサンドボックスに、メディアサーバーの場所と ffmpeg を伝える
+    if let Some(l) = &local {
+        let want = Some(cfg.media_url.trim_end_matches('/').to_string());
+        let mut up = l.0.upstream.lock().unwrap();
+        if *up != want {
+            *up = want;
+        }
+        drop(up);
+        let mut f = l.0.ffmpeg.lock().unwrap();
+        if *f != cfg.ffmpeg {
+            *f = cfg.ffmpeg.clone();
+        }
+    }
     if !sb.open {
         if sb.poller.is_some() {
             // 閉じたら止める（軽くする）
@@ -269,7 +307,11 @@ pub fn sandbox_ui(
         return Ok(());
     }
     let ctx = contexts.ctx_mut()?.clone();
-    let base = cfg.media_url.trim_end_matches('/').to_string();
+    // サンドボックスは、この PC のサンドボックス（RTMP はメディアサーバーから取り次ぐ）とやりとりする
+    let base = janscope_video::sandbox::LOCAL_MEDIA
+        .get()
+        .cloned()
+        .unwrap_or_else(|| cfg.media_url.trim_end_matches('/').to_string());
     if sb.poller.is_none() {
         sb.poller = Some(Poller::start(base.clone()));
     }
@@ -326,6 +368,7 @@ pub fn sandbox_ui(
         .resizable(true)
         .show(&ctx, |ui| {
             toolbar(ui, sb, &mut cfg, &mut face, &status, &base);
+            source_list(ui, sb, &status);
             ui.separator();
             ui.horizontal_top(|ui| {
                 let side_w = 300.0;
@@ -362,31 +405,34 @@ fn toolbar(
         if r.lost_focus() {
             let _ = cfg.save();
         }
+        ui.weak("（RTMP のカメラを受けるとき）");
         match status {
-            Some(Ok(s)) => {
-                ui.colored_label(
-                    egui::Color32::LIGHT_GREEN,
-                    format!(
-                        "● つながっています（{} ・ソース {} ・RTMP {}）",
-                        s.version,
-                        s.sources.len(),
-                        s.rtmp_port
-                    ),
-                );
-                if let Some(e) = &s.rtmp_error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 140, 100), e);
+            Some(Ok(s)) => match &s.upstream_error {
+                None if s.upstream.is_some() => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "● つながっています");
                 }
-            }
+                None => {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("● RTMP {}", s.rtmp_port));
+                }
+                Some(e) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 80),
+                        "○ つながっていません（RTMP のカメラを使うなら、ランチャーの「メディアサーバー」を起動）",
+                    )
+                    .on_hover_text(e);
+                }
+            },
             Some(Err(e)) => {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 140, 100),
-                    format!("■ つながりません（ランチャーの「メディアサーバー」を起動してください）: {e}"),
+                    format!("■ この PC のサンドボックスが応えません: {e}"),
                 );
             }
             None => {
                 ui.label("つないでいます…");
             }
         }
+        ui.weak("画像・映像・Webカメラ・URL は、メディアサーバーなしで、この PC で読み込みます");
     });
     ui.horizontal_wrapped(|ui| {
         ui.label("新しい枠の使い道:");
@@ -402,9 +448,9 @@ fn toolbar(
     ui.horizontal_wrapped(|ui| {
         let can_save = sb.dirty && sb.draft.is_some();
         if ui
-            .add_enabled(can_save, egui::Button::new("メディアサーバーに保存"))
+            .add_enabled(can_save, egui::Button::new("保存（切り出しを始める）"))
             .on_hover_text(
-                "枠とソースをメディアサーバーに送ります。切り出した映像が各処理に回ります",
+                "枠とソースを保存します。この PC のソースはこの PC で、RTMP のソースはメディアサーバーで切り出し、各処理に回ります",
             )
             .clicked()
         {
@@ -415,7 +461,7 @@ fn toolbar(
                     let body = serde_json::to_vec(&d).unwrap_or_default();
                     let r = http::put_json(&url, &body, Duration::from_secs(5));
                     *msg.lock().unwrap() = Some(match &r {
-                        Ok(_) => "メディアサーバーに保存しました".into(),
+                        Ok(_) => "保存しました".into(),
                         Err(e) => format!("保存できませんでした: {e}"),
                     });
                     if r.is_ok() {
@@ -435,7 +481,7 @@ fn toolbar(
         }
         ui.separator();
         if ui
-            .button("顔カメラをメディアサーバーから受ける")
+            .button("顔カメラをサンドボックスから受ける")
             .on_hover_text("席A〜Dの顔カメラを、この枠（選手顔 席A〜D）の切り出し映像にします")
             .clicked()
         {
@@ -443,12 +489,12 @@ fn toolbar(
             for i in 0..4 {
                 cfg.faces[i].enabled = true;
                 cfg.faces[i].mode = RtmpMode::Media;
-                cfg.faces[i].url = face_url(&cfg.media_url, i as u8);
+                cfg.faces[i].url = face_url(i as u8);
             }
             match cfg.save() {
                 Ok(()) => {
                     *sb.msg.lock().unwrap() =
-                        Some("顔カメラをメディアサーバーから受けるようにしました".into())
+                        Some("顔カメラをサンドボックスの「選手顔」の枠から受けるようにしました".into())
                 }
                 Err(e) => *sb.msg.lock().unwrap() = Some(e),
             }
@@ -597,6 +643,7 @@ fn add_source(sb: &mut SandboxUi, kind: AddKind, t: &str, name: &str) {
         id: safe_id(&format!("{prefix}-{n}")),
         name,
         kind,
+        enabled: true,
     });
     sb.dirty = true;
 }
@@ -1114,4 +1161,107 @@ fn side_panel(ui: &mut egui::Ui, sb: &mut SandboxUi, status: &Option<Result<Medi
     }
     ui.separator();
     ui.weak("選手顔の枠は配信画面の選手画面に、手牌確認・河/鳴き確認・卓全体の枠は牌の自動読み取り（これから）と確認用に回ります。保存するとメディアサーバーが切り出します");
+}
+
+/// 入力ソースの一覧（読み込む・止める・名前・消す）
+fn source_list(
+    ui: &mut egui::Ui,
+    sb: &mut SandboxUi,
+    status: &Option<Result<MediaStatus, String>>,
+) {
+    let Some(Ok(st)) = status else { return };
+    egui::CollapsingHeader::new(format!("入力ソースの一覧（{}）", st.sources.len()))
+        .id_salt("sb_sources")
+        .default_open(true)
+        .show(ui, |ui| {
+            if st.sources.is_empty() {
+                ui.weak("（まだありません。画像・映像のファイルを落とすか、上の「ソースを足す」で足してください）");
+                return;
+            }
+            let mut remove: Option<String> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("sb_sources_scroll")
+                .max_height(170.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("sb_sources_grid")
+                        .striped(true)
+                        .num_columns(7)
+                        .show(ui, |ui| {
+                            ui.strong("読み込む");
+                            ui.strong("名前");
+                            ui.strong("種類");
+                            ui.strong("場所");
+                            ui.strong("読み込み先");
+                            ui.strong("状態");
+                            ui.strong("");
+                            ui.end_row();
+                            for src in &st.sources {
+                                // 手で足したソースは下書きで直せる（RTMP の自動は一覧だけ）
+                                let idx = sb
+                                    .draft
+                                    .as_ref()
+                                    .and_then(|d| d.sources.iter().position(|x| x.id == src.id));
+                                match idx {
+                                    Some(i) => {
+                                        let d = sb.draft.as_mut().unwrap();
+                                        if ui
+                                            .checkbox(&mut d.sources[i].enabled, "")
+                                            .on_hover_text("外すと、一覧に残したまま読み込みを止めます（保存で反映）")
+                                            .changed()
+                                        {
+                                            sb.dirty = true;
+                                        }
+                                        if ui
+                                            .add_sized(
+                                                [170.0, 20.0],
+                                                egui::TextEdit::singleline(&mut d.sources[i].name),
+                                            )
+                                            .changed()
+                                        {
+                                            sb.dirty = true;
+                                        }
+                                    }
+                                    None => {
+                                        ui.weak("自動");
+                                        ui.label(&src.name);
+                                    }
+                                }
+                                ui.label(&src.kind);
+                                ui.add_sized([280.0, 20.0], egui::Label::new(egui::RichText::new(&src.detail).weak()).truncate())
+                                    .on_hover_text(&src.detail);
+                                ui.label(&src.origin);
+                                let (t, c) = if !src.enabled {
+                                    ("止めています".to_string(), egui::Color32::GRAY)
+                                } else if src.live {
+                                    (format!("● {:.0}fps", src.fps), egui::Color32::LIGHT_GREEN)
+                                } else if src.error.is_some() {
+                                    ("■ エラー".to_string(), egui::Color32::from_rgb(255, 140, 100))
+                                } else {
+                                    ("○ 待っています".to_string(), egui::Color32::GRAY)
+                                };
+                                let r = ui.colored_label(c, t);
+                                if let Some(e) = &src.error {
+                                    r.on_hover_text(e);
+                                }
+                                if idx.is_some() {
+                                    if ui
+                                        .small_button("消す")
+                                        .on_hover_text("このソースとその枠を消します（保存で反映）")
+                                        .clicked()
+                                    {
+                                        remove = Some(src.id.clone());
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            if let (Some(id), Some(d)) = (remove, sb.draft.as_mut()) {
+                d.sources.retain(|s| s.id != id);
+                d.regions.retain(|r| r.source != id);
+                sb.dirty = true;
+            }
+        });
 }

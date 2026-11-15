@@ -442,7 +442,15 @@ fn run_media(cfg: StreamConfig, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool
     let mut seq = 0u64;
     let mut backoff = Duration::from_millis(500);
     while !stop.load(Ordering::SeqCst) {
-        match http::stream(&cfg.url, Duration::from_secs(3)) {
+        let url = match sandbox::resolve_local(&cfg.url) {
+            Ok(u) => u,
+            Err(e) => {
+                shared.lock().unwrap().last_error = Some(e);
+                sleep_unless_stopped(&stop, Duration::from_secs(1));
+                continue;
+            }
+        };
+        match http::stream(&url, Duration::from_secs(3)) {
             Ok(mut r) => {
                 {
                     let mut sh = shared.lock().unwrap();
