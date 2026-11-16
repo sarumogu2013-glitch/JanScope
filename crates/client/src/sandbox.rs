@@ -195,6 +195,8 @@ pub struct SandboxUi {
     devices: Arc<Mutex<Option<Vec<String>>>>,
     msg: Arc<Mutex<Option<String>>>,
     saved: Arc<Mutex<Option<SandboxConfig>>>,
+    /// すぐ保存する（ソースを足す・消す・止めたとき。読み込みをすぐ始める）
+    save_request: bool,
 }
 
 impl Default for SandboxUi {
@@ -221,6 +223,7 @@ impl Default for SandboxUi {
             devices: Arc::new(Mutex::new(None)),
             msg: Arc::new(Mutex::new(None)),
             saved: Arc::new(Mutex::new(None)),
+            save_request: false,
         }
     }
 }
@@ -382,6 +385,10 @@ pub fn sandbox_ui(
                 });
             });
         });
+    if sb.save_request {
+        sb.save_request = false;
+        save(sb, &base);
+    }
     sb.open = open;
     if !sb.open {
         sb.poller = None;
@@ -454,21 +461,7 @@ fn toolbar(
             )
             .clicked()
         {
-            if let Some(d) = sb.draft.clone() {
-                let (url, msg, saved) =
-                    (format!("{base}/config"), sb.msg.clone(), sb.saved.clone());
-                std::thread::spawn(move || {
-                    let body = serde_json::to_vec(&d).unwrap_or_default();
-                    let r = http::put_json(&url, &body, Duration::from_secs(5));
-                    *msg.lock().unwrap() = Some(match &r {
-                        Ok(_) => "保存しました".into(),
-                        Err(e) => format!("保存できませんでした: {e}"),
-                    });
-                    if r.is_ok() {
-                        *saved.lock().unwrap() = Some(d);
-                    }
-                });
-            }
+            save(sb, base);
         }
         if sb.dirty {
             ui.colored_label(
@@ -577,7 +570,7 @@ fn toolbar(
         {
             let t = sb.add_text.trim().to_string();
             let name = sb.add_name.trim().to_string();
-            add_source(sb, sb.add_kind, &t, &name);
+            let _ = add_source(sb, sb.add_kind, &t, &name);
             sb.add_text.clear();
             sb.add_name.clear();
         }
@@ -606,10 +599,10 @@ fn toolbar(
         let path = p.to_string_lossy().into_owned();
         match kind {
             Some(k) => {
-                add_source(sb, k, &path, "");
-                *sb.msg.lock().unwrap() = Some(format!(
-                    "足しました: {path}（「メディアサーバーに保存」で使えるようになります）"
-                ));
+                if add_source(sb, k, &path, "") {
+                    *sb.msg.lock().unwrap() =
+                        Some(format!("足しました: {path}（読み込みを始めます）"));
+                }
             }
             None => {
                 *sb.msg.lock().unwrap() = Some(format!(
@@ -620,8 +613,31 @@ fn toolbar(
     }
 }
 
-/// ソースを下書きに足す
-fn add_source(sb: &mut SandboxUi, kind: AddKind, t: &str, name: &str) {
+/// 下書きを保存する（この PC のソースはこの PC へ、メディアサーバーのソースはメディアサーバーへ）
+fn save(sb: &mut SandboxUi, base: &str) {
+    let Some(d) = sb.draft.clone() else { return };
+    let (url, msg, saved) = (format!("{base}/config"), sb.msg.clone(), sb.saved.clone());
+    std::thread::spawn(move || {
+        let body = serde_json::to_vec(&d).unwrap_or_default();
+        let r = http::put_json(&url, &body, Duration::from_secs(5));
+        *msg.lock().unwrap() = Some(match &r {
+            Ok(_) => "保存しました（読み込み・切り出しを始めます）".into(),
+            Err(e) => format!("保存できませんでした: {e}"),
+        });
+        if r.is_ok() {
+            *saved.lock().unwrap() = Some(d);
+        }
+    });
+}
+
+/// ソースを足す（すぐ保存して読み込みを始める）
+fn add_source(sb: &mut SandboxUi, kind: AddKind, t: &str, name: &str) -> bool {
+    // サンドボックスの設定を受け取る前に足すと、今の設定を空で上書きしてしまうので待ってもらう
+    if sb.draft.is_none() {
+        *sb.msg.lock().unwrap() =
+            Some("サンドボックスにつないでいます。少し待ってから足してください".into());
+        return false;
+    }
     let t = t.to_string();
     let (prefix, kind) = match kind {
         AddKind::Webcam => ("cam", SourceKind::Webcam { device: t.clone() }),
@@ -646,6 +662,8 @@ fn add_source(sb: &mut SandboxUi, kind: AddKind, t: &str, name: &str) {
         enabled: true,
     });
     sb.dirty = true;
+    sb.save_request = true;
+    true
 }
 
 /// キャンバス（ソースを並べて枠を置く）
@@ -1054,6 +1072,7 @@ fn canvas(
                 d.regions.retain(|r| r.source != id);
             }
             sb.dirty = true;
+            sb.save_request = true;
             ui.close();
         }
     });
@@ -1206,10 +1225,11 @@ fn source_list(
                                         let d = sb.draft.as_mut().unwrap();
                                         if ui
                                             .checkbox(&mut d.sources[i].enabled, "")
-                                            .on_hover_text("外すと、一覧に残したまま読み込みを止めます（保存で反映）")
+                                            .on_hover_text("外すと、一覧に残したまま読み込みを止めます（すぐ反映）")
                                             .changed()
                                         {
                                             sb.dirty = true;
+                                            sb.save_request = true;
                                         }
                                         if ui
                                             .add_sized(
@@ -1246,7 +1266,7 @@ fn source_list(
                                 if idx.is_some() {
                                     if ui
                                         .small_button("消す")
-                                        .on_hover_text("このソースとその枠を消します（保存で反映）")
+                                        .on_hover_text("このソースとその枠を消します（すぐ反映）")
                                         .clicked()
                                     {
                                         remove = Some(src.id.clone());
@@ -1262,6 +1282,7 @@ fn source_list(
                 d.sources.retain(|s| s.id != id);
                 d.regions.retain(|r| r.source != id);
                 sb.dirty = true;
+                sb.save_request = true;
             }
         });
 }
