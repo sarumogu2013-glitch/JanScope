@@ -296,6 +296,15 @@ fn handle(mut s: TcpStream, st: &State) -> std::io::Result<()> {
                     return proxy(&mut s, &url, ext == "mjpg");
                 }
             }
+            // 消したソースの映像は出さない
+            if *kind != "region" && !st.all_sources().iter().any(|x| x.id == name) {
+                return respond(
+                    &mut s,
+                    404,
+                    "text/plain; charset=utf-8",
+                    "そのソースはありません".as_bytes(),
+                );
+            }
             let bus_name = match *kind {
                 "region" => format!("region/{name}"),
                 _ => format!("preview/{name}"),

@@ -165,6 +165,15 @@ impl State {
         let text = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?;
         std::fs::write(&self.config_path, text)
             .map_err(|e| format!("{}: {e}", self.config_path.display()))?;
+        // 消したソースの最後の1枚は捨てる（もう出さない）
+        let keep: Vec<String> = c
+            .sources
+            .iter()
+            .map(|s| format!("preview/{}", s.id))
+            .collect();
+        self.buses.lock().unwrap().retain(|k, _| {
+            !k.starts_with("preview/") || keep.contains(k) || k.starts_with("preview/rtmp-")
+        });
         *self.config.lock().unwrap() = c;
         self.version.fetch_add(1, Ordering::SeqCst);
         Ok(())

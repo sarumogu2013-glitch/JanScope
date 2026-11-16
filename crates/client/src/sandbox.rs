@@ -303,9 +303,12 @@ pub fn sandbox_ui(
     }
     if !sb.open {
         if sb.poller.is_some() {
-            // 閉じたら止める（軽くする）
+            // 閉じたら止める（軽くする。絵も捨ててビデオメモリを空ける）
             sb.poller = None;
             sb.players.clear();
+            sb.view.clear();
+            sb.slots.clear();
+            sb.tex.clear();
         }
         return Ok(());
     }
@@ -333,6 +336,19 @@ pub fn sandbox_ui(
     if let Some(Ok(st)) = &status {
         if !sb.dirty {
             sb.draft = Some(st.config.clone());
+        }
+        // 消した・止めたソースは、映像の受け取りと絵（ビデオメモリ）を片づける
+        let gone: Vec<String> = sb
+            .view
+            .keys()
+            .filter(|id| !st.sources.iter().any(|s| &s.id == *id && s.live))
+            .cloned()
+            .collect();
+        for id in gone {
+            sb.view.remove(&id);
+            sb.players.remove(&id);
+            sb.slots.remove(&id);
+            sb.tex.remove(&id);
         }
         // 初めて見るソースはキャプチャ画（軽い）にする
         for s in &st.sources {
@@ -393,6 +409,9 @@ pub fn sandbox_ui(
     if !sb.open {
         sb.poller = None;
         sb.players.clear();
+        sb.view.clear();
+        sb.slots.clear();
+        sb.tex.clear();
     }
     ctx.request_repaint_after(Duration::from_millis(100));
     Ok(())
