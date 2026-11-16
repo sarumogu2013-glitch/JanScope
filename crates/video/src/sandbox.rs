@@ -76,12 +76,15 @@ impl SourceKind {
                 a
             }
             SourceKind::Video { path } => {
-                let mut a = v(&["-stream_loop", "-1", "-re", "-i"]);
+                // 4K の HEVC（GoPro など）は CPU では重いので、使えれば GPU でデコードする（使えなければ CPU）
+                let mut a = hwaccel();
+                a.extend(v(&["-stream_loop", "-1", "-re", "-i"]));
                 a.push(path.clone());
                 a
             }
             SourceKind::Url { url } => {
-                let mut a = v(&["-i"]);
+                let mut a = hwaccel();
+                a.extend(v(&["-i"]));
                 a.push(url.clone());
                 a
             }
@@ -190,7 +193,7 @@ impl Region {
         }
     }
 
-    /// ffmpeg のフィルター（切り出し → 大きさ → fps）
+    /// ffmpeg のフィルター（fps → 切り出し → 大きさ）
     pub fn filter(&self) -> String {
         let r = self.clamped();
         let (w, h, fps) = r.role.output();
@@ -200,7 +203,8 @@ impl Region {
             String::new()
         };
         format!(
-            "crop=w=iw*{:.4}:h=ih*{:.4}:x=iw*{:.4}:y=ih*{:.4},scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{pad},fps={fps}",
+            // fps を先に落とす（使わないコマの切り出し・縮小をしない。4K60 の映像だと大きく軽くなる）
+            "fps={fps},crop=w=iw*{:.4}:h=ih*{:.4}:x=iw*{:.4}:y=ih*{:.4},scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{pad}",
             r.w, r.h, r.x, r.y
         )
     }
@@ -268,6 +272,28 @@ pub struct SourceStatus {
     pub detail: String,
 }
 
+/// GPU でデコードする引数（Windows は D3D11。使えなければ ffmpeg が CPU に戻す）
+fn hwaccel() -> Vec<String> {
+    if cfg!(windows) {
+        vec!["-hwaccel".into(), "d3d11va".into()]
+    } else {
+        vec![]
+    }
+}
+
+/// ffmpeg のエラー出力のうち、GPU デコードが使えず CPU に戻ったことの知らせ（エラーではない）
+pub fn is_hwaccel_notice(line: &str) -> bool {
+    [
+        "hwaccel",
+        "AVHWDeviceContext",
+        "Device creation failed",
+        "D3D11",
+        "d3d11va",
+    ]
+    .iter()
+    .any(|k| line.contains(k))
+}
+
 /// 入力担当の中のメディア（この PC のファイル・Webカメラ）の HTTP の場所（起動したら入る）
 pub static LOCAL_MEDIA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -331,7 +357,7 @@ mod tests {
         };
         let f = r.filter();
         assert!(
-            f.starts_with("crop=w=iw*0.5000:h=ih*0.5000:x=iw*0.5000"),
+            f.starts_with("fps=30,crop=w=iw*0.5000:h=ih*0.5000:x=iw*0.5000"),
             "{f}"
         );
         assert!(f.contains("pad=1066:600"));

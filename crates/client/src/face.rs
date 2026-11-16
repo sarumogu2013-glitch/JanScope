@@ -15,6 +15,51 @@ use crate::program::Program;
 pub const FACE_W: u32 = 1066;
 pub const FACE_H: u32 = 600;
 
+type Decoded = Result<(u32, u32, Vec<u8>), String>;
+
+/// 顔カメラの JPEG を裏でデコードする（描画のスレッドを止めない。間に合わないコマは飛ばす）
+struct Decoder {
+    req: std::sync::Arc<(
+        std::sync::Mutex<Option<std::sync::Arc<Vec<u8>>>>,
+        std::sync::Condvar,
+    )>,
+    out: std::sync::Arc<std::sync::Mutex<Option<Decoded>>>,
+}
+
+impl Decoder {
+    fn new() -> Self {
+        let req: std::sync::Arc<(
+            std::sync::Mutex<Option<std::sync::Arc<Vec<u8>>>>,
+            std::sync::Condvar,
+        )> = Default::default();
+        let out: std::sync::Arc<std::sync::Mutex<Option<Decoded>>> = Default::default();
+        let (r, o) = (req.clone(), out.clone());
+        std::thread::spawn(move || {
+            loop {
+                let jpeg = {
+                    let (m, cv) = &*r;
+                    let mut g = cv.wait_while(m.lock().unwrap(), |j| j.is_none()).unwrap();
+                    g.take().unwrap()
+                };
+                let res = decode_rgba(&jpeg).map_err(|e| e.to_string());
+                *o.lock().unwrap() = Some(res);
+            }
+        });
+        Decoder { req, out }
+    }
+
+    /// デコードを頼む（前の頼みがまだなら、新しいほうに置き換える）
+    fn submit(&self, jpeg: std::sync::Arc<Vec<u8>>) {
+        let (m, cv) = &*self.req;
+        *m.lock().unwrap() = Some(jpeg);
+        cv.notify_one();
+    }
+
+    fn take(&self) -> Option<Decoded> {
+        self.out.lock().unwrap().take()
+    }
+}
+
 #[derive(Resource)]
 pub struct FaceRuntime {
     pub sw: FaceSwitcher,
@@ -28,6 +73,7 @@ pub struct FaceRuntime {
     pub output: FaceOutput,
     pub delay_secs: f64,
     pub sync_offset_ms: [i32; 4],
+    decoders: [Decoder; 4],
 }
 
 impl FaceRuntime {
@@ -109,6 +155,7 @@ pub fn setup_face(
         output: cfg.face_output,
         delay_secs: cfg.delay_secs,
         sync_offset_ms: cfg.sync_offset_ms,
+        decoders: std::array::from_fn(|_| Decoder::new()),
     };
     rt.apply(&cfg);
     commands.insert_resource(rt);
@@ -173,6 +220,21 @@ pub fn face_update(
         let target = std::time::Instant::now()
             .checked_sub(back)
             .unwrap_or_else(std::time::Instant::now);
+        // 裏でデコードが済んだ絵を書き込む
+        match rt.decoders[i].take() {
+            Some(Ok((w, h, px))) if w == FACE_W && h == FACE_H => {
+                if let Some(mut img) = images.get_mut(&rt.images[i]) {
+                    img.data = Some(px);
+                    rt.has_frame[i] = true;
+                }
+            }
+            Some(Ok((w, h, _))) => warn!(
+                "顔カメラ{}の大きさが違います: {w}x{h}",
+                SeatId(i as u8).label()
+            ),
+            Some(Err(e)) => warn!("顔カメラ{}の映像を読めません: {e}", SeatId(i as u8).label()),
+            None => {}
+        }
         let Some(f) = rt.streams[i].as_ref().and_then(|s| s.frame_at(target)) else {
             continue;
         };
@@ -180,19 +242,7 @@ pub fn face_update(
             continue;
         }
         rt.last_seq[i] = f.seq;
-        match decode_rgba(&f.data) {
-            Ok((w, h, px)) if w == FACE_W && h == FACE_H => {
-                if let Some(mut img) = images.get_mut(&rt.images[i]) {
-                    img.data = Some(px);
-                    rt.has_frame[i] = true;
-                }
-            }
-            Ok((w, h, _)) => warn!(
-                "顔カメラ{}の大きさが違います: {w}x{h}",
-                SeatId(i as u8).label()
-            ),
-            Err(e) => warn!("顔カメラ{}の映像を読めません: {e}", SeatId(i as u8).label()),
-        }
+        rt.decoders[i].submit(f.data.clone());
     }
     if let Some(o) = &rt.obs {
         o.show_seat(cur.0);

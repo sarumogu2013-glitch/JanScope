@@ -187,6 +187,11 @@ fn main() {
     };
     windows::EMBEDDED.store(args.embed, std::sync::atomic::Ordering::Relaxed);
     let mut app = App::new();
+    // ほかのソフト（OBS など）を触っていても、配信画面・顔カメラを止めずに描き続ける
+    app.insert_resource(bevy::winit::WinitSettings {
+        focused_mode: bevy::winit::UpdateMode::Continuous,
+        unfocused_mode: bevy::winit::UpdateMode::Continuous,
+    });
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {

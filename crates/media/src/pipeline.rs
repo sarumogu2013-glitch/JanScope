@@ -239,7 +239,9 @@ pub fn run(src: SourceDef, st: Arc<State>, stop: Arc<AtomicBool>) {
             std::thread::spawn(move || {
                 let mut s = String::new();
                 let _ = err.read_to_string(&mut s);
-                if let Some(l) = s.lines().rev().find(|l| !l.trim().is_empty()) {
+                if let Some(l) = s.lines().rev().find(|l| {
+                    !l.trim().is_empty() && !janscope_video::sandbox::is_hwaccel_notice(l)
+                }) {
                     println!("{} {name}: ffmpeg: {l}", now());
                     st2.errors.lock().unwrap().insert(id, l.to_string());
                 }
