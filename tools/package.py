@@ -36,6 +36,32 @@ FFMPEG_README = """顔カメラ（RTMP）の取り込みには FFmpeg が必要�
 - このフォルダは自動アップデートで上書きされません
 """
 
+MODELS_README = """牌認識のモデルを置く場所
+
+公開されている・自分で学習した ONNX の牌認識モデルを、このフォルダに置きます。
+入力担当の「映像サンドボックス → 牌認識を試す」で読み込み、手牌・河の枠の切り出しで認識を試せます。
+
+■ 置くもの
+  - 検出モデル（必須）: Ultralytics YOLO（v8 / 11 / 26 など）を ONNX に書き出したもの（xxx.onnx）
+  - 分類モデル（任意）: 牌1枚の画像 → 種類（ファイル名に classifier / cls / resnet を含めるか、.json の kind で区別）
+  - それぞれ同じ名前の .json（クラス名・入力の大きさ。export_onnx.py が書き出す）
+
+■ .pt（PyTorch）のモデルを ONNX にする
+  Python 3.10 以上を入れて、このフォルダで:
+    pip install ultralytics
+    python export_onnx.py detector  tile-yolo-26n.pt --out .
+    python export_onnx.py classifier classifier-resnet50.pt --out . [--classes classes.txt] [--size 幅 高さ]
+
+■ 使う
+  1. 入力担当で「映像サンドボックス」を開き、手牌確認・河/鳴き確認などの枠を置く
+  2. 「牌認識を試す」→ 検出モデル・分類モデルを選んで「モデルを読み込む」
+  3. 試す枠を選んで「今の画で認識」（「続けて認識」で繰り返し）
+
+■ 注意
+  - モデルのライセンスは、そのモデルの配布元の条件に従ってください（JanScope には入っていません）
+  - このフォルダは自動アップデートで消えません（このテキストと export_onnx.py だけ上書きされます）
+"""
+
 START_TXT = """JanScope {version}
 
 このソフトウェアは AI（Anthropic の Claude）で作成しました。人による網羅的なコードレビューは行っていません。
@@ -55,7 +81,11 @@ START_TXT = """JanScope {version}
 ■ 更新
   起動時に新しい版があるかだけ確かめます。入れ替えは、クライアントの「設定 → 更新」か
   janscope-server.exe --update で行います（配信中は行わないでください）。
-  設定（janscope-client.json）・data フォルダ・ffmpeg フォルダはそのまま残ります。
+  設定（janscope-client.json）・data フォルダ・ffmpeg フォルダ・models フォルダのモデルはそのまま残ります。
+
+■ 牌認識
+  公開されている・自分で学習した ONNX の牌認識モデルを models フォルダに置き、
+  入力担当の「映像サンドボックス → 牌認識を試す」で試せます。入れ方は models/モデルの入れ方.txt
 
 ■ ライセンス
   本体: MIT OR Apache-2.0（LICENSE-MIT / LICENSE-APACHE）
@@ -116,6 +146,10 @@ def build(bin_dir: pathlib.Path, suffix: str, out: pathlib.Path, rust_licenses: 
     # ffmpeg フォルダは案内だけ（利用者が置く。zip には ffmpeg 本体を入れない）
     (stage / "ffmpeg").mkdir()
     (stage / "ffmpeg" / "ffmpeg を置く場所.txt").write_text(FFMPEG_README, encoding="utf-8")
+    # models フォルダは案内と書き出しスクリプトだけ（モデルは利用者が置く）
+    (stage / "models").mkdir()
+    (stage / "models" / "モデルの入れ方.txt").write_text(MODELS_README, encoding="utf-8")
+    shutil.copy2(ROOT / "tools" / "export_onnx.py", stage / "models" / "export_onnx.py")
 
     out.mkdir(parents=True, exist_ok=True)
     zpath = out / f"janscope-{version}-{suffix}.zip"

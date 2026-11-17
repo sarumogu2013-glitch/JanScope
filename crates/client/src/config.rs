@@ -56,6 +56,8 @@ pub struct ClientConfig {
     pub prefs: crate::prefs::Prefs,
     /// メディアサーバーの場所（映像サンドボックス・顔カメラの「メディアサーバー」）
     pub media_url: String,
+    /// 牌認識のモデル
+    pub recog: crate::recog_ui::RecogConfig,
 }
 
 impl Default for ClientConfig {
@@ -75,6 +77,7 @@ impl Default for ClientConfig {
             sync_offset_ms: [0; 4],
             prefs: crate::prefs::Prefs::default(),
             media_url: janscope_video::sandbox::DEFAULT_MEDIA_URL.into(),
+            recog: Default::default(),
         }
     }
 }

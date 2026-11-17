@@ -1,0 +1,14 @@
+[package]
+name = "janscope-recog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "JanScope 牌認識（ONNX の検出・分類モデルを読み込んで動かす）"
+
+[dependencies]
+janscope-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tract-onnx = "0.23"

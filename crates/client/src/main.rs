@@ -20,6 +20,7 @@ mod output;
 mod player_screen;
 mod prefs;
 mod program;
+mod recog_ui;
 mod replay;
 mod sandbox;
 mod scenes;

@@ -197,6 +197,8 @@ pub struct SandboxUi {
     saved: Arc<Mutex<Option<SandboxConfig>>>,
     /// すぐ保存する（ソースを足す・消す・止めたとき。読み込みをすぐ始める）
     save_request: bool,
+    /// 牌認識を試す窓
+    recog: crate::recog_ui::RecogUi,
 }
 
 impl Default for SandboxUi {
@@ -224,6 +226,7 @@ impl Default for SandboxUi {
             msg: Arc::new(Mutex::new(None)),
             saved: Arc::new(Mutex::new(None)),
             save_request: false,
+            recog: Default::default(),
         }
     }
 }
@@ -302,6 +305,9 @@ pub fn sandbox_ui(
         }
     }
     if !sb.open {
+        if sb.recog.open {
+            sb.recog.close();
+        }
         if sb.poller.is_some() {
             // 閉じたら止める（軽くする。絵も捨ててビデオメモリを空ける）
             sb.poller = None;
@@ -405,6 +411,19 @@ pub fn sandbox_ui(
         sb.save_request = false;
         save(sb, &base);
     }
+    // 牌認識を試す窓（枠の切り出しで試す。顔の枠は除く）
+    let regions: Vec<(String, String)> = sb
+        .draft
+        .as_ref()
+        .map(|d| {
+            d.regions
+                .iter()
+                .filter(|r| !matches!(r.role, RegionRole::Face(_)))
+                .map(|r| (r.role.id(), r.role.label()))
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::recog_ui::window(&ctx, &mut sb.recog, &mut cfg, &base, &regions);
     sb.open = open;
     if !sb.open {
         sb.poller = None;
@@ -492,6 +511,13 @@ fn toolbar(
             }
         }
         ui.separator();
+        if ui
+            .button("牌認識を試す")
+            .on_hover_text("ONNX の牌認識モデルを読み込んで、手牌・河の枠の切り出しで認識を試します")
+            .clicked()
+        {
+            sb.recog.open = true;
+        }
         if ui
             .button("顔カメラをサンドボックスから受ける")
             .on_hover_text("席A〜Dの顔カメラを、この枠（選手顔 席A〜D）の切り出し映像にします")

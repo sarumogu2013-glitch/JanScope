@@ -46,6 +46,7 @@
 | `launcher/` | ランチャー `JanScope.exe`（C++・Win32）。サーバー・クライアントを1か所から起動、更新、バージョン情報 |
 | `crates/media/` | メディアサーバー `janscope-media`（カメラ・画像・映像を受けて、映像サンドボックスの枠で切り出して入力担当に渡す） |
 | `crates/majsoul/` | 雀魂の牌譜の取り込み `janscope-majsoul`（Chrome の DevTools で通信を読み、ゲームの型定義で protobuf をデコードして対局履歴に変換） |
+| `crates/recog/` | 牌認識 `janscope-recog`（ONNX の検出・分類モデルを tract で動かす。モデルは利用者が `models/` に置く） |
 | `crates/update/` | 自動アップデート（GitHub Releases の確認・取得・入れ替え） |
 | `assets/fonts/` | Noto Sans JP（OFL） |
 | `tools/` | 開発用スクリプト（点数計算の突き合わせケース生成、配布 zip の作成） |
@@ -94,10 +95,29 @@ cargo run -p janscope-server -- --dummy
 
 テスト: `cargo test --workspace`（RTMP のテストは ffmpeg がある環境でだけ動きます）
 
+## 牌認識のモデル（利用者が入れる）
+
+配布 zip には牌認識のモデルを入れていません。公開されている・自分で学習した ONNX のモデルを、配布フォルダの `models/` に置いて使います。
+
+1. モデルを用意する
+   - ONNX ならそのまま。PyTorch（`.pt`）なら、`models/export_onnx.py`（このリポジトリの `tools/export_onnx.py`）で ONNX にする
+     ```sh
+     pip install ultralytics
+     python export_onnx.py detector  tile-yolo-26n.pt --out .          # 検出（YOLO v8 / 11 / 26、検出・セグメンテーション）
+     python export_onnx.py classifier classifier-resnet50.pt --out .   # 分類（torchvision の ResNet）。クラス名がなければ --classes
+     ```
+   - 自分で学習する場合は `training/` の `export`（`tile_detector.onnx` / `tile_classifier.onnx` と `.json` を書き出す）
+2. `.onnx` と同じ名前の `.json` を `models/` に置く（`.json` はクラス名・入力の大きさ。なければ ONNX の中の Ultralytics の情報を使う）
+3. 入力担当の「映像サンドボックス → 牌認識を試す」で、検出モデル（と分類モデル）を選んで「モデルを読み込む」→ 試す枠を選んで「今の画で認識」
+
+- 検出モデルのクラスが牌の種類（`1m`〜`7z`・`0m`・`back`、`Man1`・`中`・`一萬` などの別名も可）なら検出だけで種類まで分かる。クラスが「牌」1つなら分類モデルを合わせる
+- 牌として読めないクラス名は、`.json` の `classes` に正規の名前（`1m` など）を並べて直す
+- モデルのライセンスは配布元の条件に従う（JanScope には入れない）。`models/` は自動アップデートで消えない
+
 ## 更新とリリース
 
 - アプリは起動時に新しい版があるかだけ確かめます（配布フォルダから動いているとき）。入れ替えはクライアントの「設定 → 更新」か `janscope-server --update` で、人が行います。配信中は行わないでください
-- 入れ替えで、設定（`janscope-client.json`）・`data/`・`ffmpeg/` は消えません
+- 入れ替えで、設定（`janscope-client.json`）・`data/`・`ffmpeg/`・`models/` のモデルは消えません
 - リリースの出し方:
   1. `Cargo.toml` の `[workspace.package] version` を上げてコミット
   2. `CHANGELOG.md` に `## 0.2.0` の節を書く（これがリリースの説明になる）

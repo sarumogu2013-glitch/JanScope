@@ -15,6 +15,7 @@ path = "src/main.rs"
 janscope-core.workspace = true
 janscope-netclient.workspace = true
 janscope-video.workspace = true
+janscope-recog.workspace = true
 janscope-update.workspace = true
 # この PC のファイル・Webカメラ・URL を、メディアサーバーを通さずに映像サンドボックスへ入れる
 janscope-media.workspace = true
