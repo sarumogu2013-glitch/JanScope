@@ -199,6 +199,9 @@ pub struct SandboxUi {
     save_request: bool,
     /// 牌認識を試す窓
     recog: crate::recog_ui::RecogUi,
+    /// 枠・名前を変えたら、少し待ってから保存する（ドラッグ中は待つ）
+    save_due: Option<std::time::Instant>,
+    last_draft: Option<SandboxConfig>,
 }
 
 impl Default for SandboxUi {
@@ -227,6 +230,8 @@ impl Default for SandboxUi {
             saved: Arc::new(Mutex::new(None)),
             save_request: false,
             recog: Default::default(),
+            save_due: None,
+            last_draft: None,
         }
     }
 }
@@ -407,8 +412,24 @@ pub fn sandbox_ui(
                 });
             });
         });
+    // 枠を置く・動かす・大きさを変える・消す・名前を変えたら、手を離して少ししてから保存する
+    // （保存すると切り出しが始まり直すので、ドラッグ中は保存しない）
+    if sb.dirty {
+        if sb.draft != sb.last_draft {
+            sb.last_draft = sb.draft.clone();
+            sb.save_due = Some(std::time::Instant::now() + Duration::from_millis(700));
+        }
+    } else {
+        sb.last_draft = None;
+        sb.save_due = None;
+    }
+    if sb.drag.is_none() && sb.save_due.is_some_and(|t| std::time::Instant::now() >= t) {
+        sb.save_due = None;
+        sb.save_request = true;
+    }
     if sb.save_request {
         sb.save_request = false;
+        sb.save_due = None;
         save(sb, &base);
     }
     // 牌認識を試す窓（枠の切り出しで試す。顔の枠は除く）

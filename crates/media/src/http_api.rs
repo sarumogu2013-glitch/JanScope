@@ -292,6 +292,23 @@ fn handle(mut s: TcpStream, st: &State) -> std::io::Result<()> {
                 };
                 let up = st.upstream.lock().unwrap().clone();
                 if let (false, Some(up)) = (here, up) {
+                    // メディアサーバーにもない（つながっていない）なら、分かる言葉で返す
+                    if st.upstream_ok().is_none() {
+                        let what = if *kind == "region" {
+                            "枠"
+                        } else {
+                            "ソース"
+                        };
+                        return respond(
+                            &mut s,
+                            404,
+                            "text/plain; charset=utf-8",
+                            format!(
+                                "この{what}（{name}）は、この PC のサンドボックスにありません（まだ保存していないか、メディアサーバーのソースの{what}で、メディアサーバーにつながっていません）"
+                            )
+                            .as_bytes(),
+                        );
+                    }
                     let url = format!("{}/{kind}/{file}", up.trim_end_matches('/'));
                     return proxy(&mut s, &url, ext == "mjpg");
                 }
