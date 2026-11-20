@@ -4,6 +4,7 @@
 
     pip install ultralytics                      # 検出モデル（YOLO）を書き出すのに使う
     python export_onnx.py detector  tile-yolo-26n.pt           [--out models]
+    python export_onnx.py detector  regions-yolo-26n.pt        [--out models]   # 領域（手牌・河・副露など）
     python export_onnx.py classifier classifier-resnet50.pt    [--out models] [--size 224 224] [--classes classes.txt]
 
 - detector:  Ultralytics YOLO（v8 / 11 / 26 など。検出・セグメンテーションどちらでも）→ <名前>.onnx と <名前>.json
@@ -37,7 +38,7 @@ def export_detector(pt: Path, out: Path, imgsz: int | None) -> None:
         shutil.copyfile(path, dst)
     names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
     meta = {
-        "kind": "janscope-tile-detector",
+        "kind": "janscope-region-detector" if "region" in pt.name.lower() else "janscope-tile-detector",
         "framework": "ultralytics-yolo",
         "task": getattr(model, "task", ""),
         "classes": [names[k] for k in sorted(names)],

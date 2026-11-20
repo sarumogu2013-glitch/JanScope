@@ -105,6 +105,7 @@ cargo run -p janscope-server -- --dummy
      pip install ultralytics
      python export_onnx.py detector  tile-yolo-26n.pt --out .          # 検出（YOLO v8 / 11 / 26、検出・セグメンテーション）
      python export_onnx.py classifier classifier-resnet50.pt --out .   # 分類（torchvision の ResNet）。クラス名がなければ --classes
+     python export_onnx.py detector  regions-yolo-26n.pt --out .       # 領域（手牌・河・副露などの場所。任意）
      ```
    - 自分で学習する場合は `training/` の `export`（`tile_detector.onnx` / `tile_classifier.onnx` と `.json` を書き出す）
 2. `.onnx` と同じ名前の `.json` を `models/` に置く（`.json` はクラス名・入力の大きさ。なければ ONNX の中の Ultralytics の情報を使う）

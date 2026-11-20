@@ -44,18 +44,21 @@ MODELS_README = """牌認識のモデルを置く場所
 ■ 置くもの
   - 検出モデル（必須）: Ultralytics YOLO（v8 / 11 / 26 など）を ONNX に書き出したもの（xxx.onnx）
   - 分類モデル（任意）: 牌1枚の画像 → 種類（ファイル名に classifier / cls / resnet を含めるか、.json の kind で区別）
+  - 領域モデル（任意）: 卓の画像 → 手牌・河・副露などの場所（ファイル名に region を含める）。場所ごとに牌を探し、どこの牌かも出す
   - それぞれ同じ名前の .json（クラス名・入力の大きさ。export_onnx.py が書き出す）
 
 ■ .pt（PyTorch）のモデルを ONNX にする
   Python 3.10 以上を入れて、このフォルダで:
     pip install ultralytics
     python export_onnx.py detector  tile-yolo-26n.pt --out .
+    python export_onnx.py detector  regions-yolo-26n.pt --out .   （領域モデル。使うときだけ）
     python export_onnx.py classifier classifier-resnet50.pt --out . [--classes classes.txt] [--size 幅 高さ]
 
 ■ 使う
   1. 入力担当で「映像サンドボックス」を開き、手牌確認・河/鳴き確認などの枠を置く
   2. 「牌認識を試す」→ 検出モデル・分類モデルを選んで「モデルを読み込む」
   3. 試す枠を選んで「今の画で認識」（「続けて認識」で繰り返し）
+     見つからない牌があるときは「検出のしきい値」を下げる。領域モデルは「卓全体」の枠で使う
 
 ■ 注意
   - モデルのライセンスは、そのモデルの配布元の条件に従ってください（JanScope には入っていません）

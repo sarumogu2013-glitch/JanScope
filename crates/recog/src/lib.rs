@@ -248,22 +248,54 @@ pub struct Detection {
     pub name: String,
     /// 確信度（検出 × 分類）
     pub score: f32,
+    /// 領域モデルを使ったとき、その牌がある領域の名前（手牌・河・副露など）
+    pub area: Option<String>,
 }
 
-/// 検出（＋分類）
+/// 領域モデルが見つけた領域
+#[derive(Clone, Debug)]
+pub struct Area {
+    pub bbox: [f32; 4],
+    pub name: String,
+    pub score: f32,
+}
+
+/// 認識の結果
+#[derive(Clone, Debug, Default)]
+pub struct Recognition {
+    pub tiles: Vec<Detection>,
+    pub areas: Vec<Area>,
+    /// モデルの出力の様子（うまく出ないときの手がかり）
+    pub info: String,
+}
+
+/// 検出・領域モデルの1回分（確信度, 枠, クラス）と、出力の様子
+struct RawDet {
+    boxes: Vec<(f32, [f32; 4], usize)>,
+    info: String,
+}
+
+/// 領域モデル（手牌・河・副露など）→ 牌の検出 → 分類
 pub struct Recognizer {
     det: Onnx,
     cls: Option<Onnx>,
-    pub score_threshold: f32,
+    regions: Option<Onnx>,
     pub iou_threshold: f32,
 }
 
-/// フォルダの中から、検出モデルと分類モデルを探す
-pub fn find_models(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut det = vec![];
-    let mut cls = vec![];
+/// フォルダの中のモデル（検出・分類・領域）
+#[derive(Clone, Debug, Default)]
+pub struct Found {
+    pub detectors: Vec<PathBuf>,
+    pub classifiers: Vec<PathBuf>,
+    pub regions: Vec<PathBuf>,
+}
+
+/// フォルダの中から、検出・分類・領域モデルを探す（.json の kind、なければファイル名で分ける）
+pub fn find_models(dir: &Path) -> Found {
+    let mut f = Found::default();
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return (det, cls);
+        return f;
     };
     let mut files: Vec<PathBuf> = rd
         .flatten()
@@ -274,35 +306,65 @@ pub fn find_models(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         })
         .collect();
     files.sort();
-    for f in files {
-        let kind: Option<String> = std::fs::read_to_string(f.with_extension("json"))
+    for p in files {
+        let kind: String = std::fs::read_to_string(p.with_extension("json"))
             .ok()
             .and_then(|t| serde_json::from_str::<Sidecar>(&t).ok())
-            .and_then(|s| s.kind);
-        let name = f
+            .and_then(|s| s.kind)
+            .unwrap_or_default()
+            .to_lowercase();
+        let name = p
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let is_cls = match kind.as_deref() {
-            Some(k) if k.contains("classifier") => true,
-            Some(k) if k.contains("detector") => false,
-            _ => name.contains("classif") || name.contains("cls") || name.contains("resnet"),
-        };
-        if is_cls { cls.push(f) } else { det.push(f) }
+        if kind.contains("region") || name.contains("region") {
+            f.regions.push(p);
+        } else if kind.contains("classifier")
+            || (!kind.contains("detector")
+                && (name.contains("classif") || name.contains("cls") || name.contains("resnet")))
+        {
+            f.classifiers.push(p);
+        } else {
+            f.detectors.push(p);
+        }
     }
-    (det, cls)
+    f
+}
+
+fn load_detector(p: &Path, what: &str) -> Result<Onnx, String> {
+    let m = Onnx::load(p, |_| (640, 640))?;
+    if m.out_shape.len() != 3 {
+        return Err(format!(
+            "{}: {what}の出力の形が分かりません: {:?}",
+            p.display(),
+            m.out_shape
+        ));
+    }
+    Ok(m)
+}
+
+/// 画像の一部を切り抜く
+fn crop(img: &Rgba, b: [f32; 4]) -> (usize, usize, Vec<u8>) {
+    let x0 = (b[0].floor().max(0.0) as usize).min(img.w - 1);
+    let y0 = (b[1].floor().max(0.0) as usize).min(img.h - 1);
+    let x1 = (b[2].ceil() as usize).clamp(x0 + 1, img.w);
+    let y1 = (b[3].ceil() as usize).clamp(y0 + 1, img.h);
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut px = Vec::with_capacity(w * h * 4);
+    for y in y0..y1 {
+        let s = (y * img.w + x0) * 4;
+        px.extend_from_slice(&img.px[s..s + w * 4]);
+    }
+    (w, h, px)
 }
 
 impl Recognizer {
-    pub fn load(detector: &Path, classifier: Option<&Path>) -> Result<Recognizer, String> {
-        let det = Onnx::load(detector, |_| (640, 640))?;
-        if det.out_shape.len() != 3 {
-            return Err(format!(
-                "{}: 検出モデルの出力の形が分かりません: {:?}",
-                detector.display(),
-                det.out_shape
-            ));
-        }
+    pub fn load(
+        detector: &Path,
+        classifier: Option<&Path>,
+        regions: Option<&Path>,
+    ) -> Result<Recognizer, String> {
+        let det = load_detector(detector, "検出モデル")?;
         let cls = match classifier {
             Some(p) => {
                 let c = Onnx::load(p, |_| (96, 128))?;
@@ -317,38 +379,45 @@ impl Recognizer {
             }
             None => None,
         };
-        let score_threshold = det.side.score.unwrap_or(0.35);
+        let regions = match regions {
+            Some(p) => Some(load_detector(p, "領域モデル")?),
+            None => None,
+        };
         let iou_threshold = det.side.iou.unwrap_or(0.5);
         Ok(Recognizer {
             det,
             cls,
-            score_threshold,
+            regions,
             iou_threshold,
         })
     }
 
+    /// モデルの .json に書いた検出のしきい値（なければ 0.25）
+    pub fn default_score(&self) -> f32 {
+        self.det.side.score.unwrap_or(0.25)
+    }
+
     /// 読み込んだモデルの説明（画面に出す）
     pub fn describe(&self) -> String {
-        let d = &self.det;
-        let mut s = format!(
-            "検出: {}（{}×{}・クラス {}）",
-            d.file.file_name().unwrap_or_default().to_string_lossy(),
-            d.w,
-            d.h,
-            if d.names.is_empty() {
-                "名前なし".to_string()
-            } else {
-                d.names.len().to_string()
-            }
-        );
+        let one = |m: &Onnx| {
+            format!(
+                "{}（{}×{}・クラス {}）",
+                m.file.file_name().unwrap_or_default().to_string_lossy(),
+                m.w,
+                m.h,
+                if m.names.is_empty() {
+                    "名前なし".to_string()
+                } else {
+                    m.names.len().to_string()
+                }
+            )
+        };
+        let mut s = format!("検出: {}", one(&self.det));
         if let Some(c) = &self.cls {
-            s += &format!(
-                " ／ 分類: {}（{}×{}・クラス {}）",
-                c.file.file_name().unwrap_or_default().to_string_lossy(),
-                c.w,
-                c.h,
-                c.names.len()
-            );
+            s += &format!(" ／ 分類: {}", one(c));
+        }
+        if let Some(r) = &self.regions {
+            s += &format!(" ／ 領域: {}", one(r));
         }
         let known = self
             .class_names()
@@ -369,129 +438,258 @@ impl Recognizer {
         }
     }
 
-    /// 画像の中の牌を見つける
-    pub fn recognize(&self, img: &Rgba) -> Result<Vec<Detection>, String> {
+    pub fn has_regions(&self) -> bool {
+        self.regions.is_some()
+    }
+
+    /// 画像の中の牌を見つける（score は検出のしきい値）
+    pub fn recognize(&self, img: &Rgba, score: f32) -> Result<Recognition, String> {
         if img.w < 2 || img.h < 2 || img.px.len() < img.w * img.h * 4 {
             return Err("画像が空です".into());
         }
-        let mut dets = self.detect(img)?;
+        let mut out = Recognition::default();
+        // 領域モデルがあれば、領域ごとに切り抜いて牌を探す
+        let parts: Vec<(Option<String>, [f32; 4])> = match &self.regions {
+            Some(rm) => {
+                let raw = run_detector(rm, img, score, self.iou_threshold)?;
+                out.info += &format!("領域: {} ／ ", raw.info);
+                for (sc, b, k) in &raw.boxes {
+                    out.areas.push(Area {
+                        bbox: *b,
+                        name: rm.names.get(*k).cloned().unwrap_or_else(|| format!("#{k}")),
+                        score: *sc,
+                    });
+                }
+                if out.areas.is_empty() {
+                    // 領域が見つからなければ、画像全体で探す
+                    vec![(None, [0.0, 0.0, img.w as f32, img.h as f32])]
+                } else {
+                    out.areas
+                        .iter()
+                        .map(|a| (Some(a.name.clone()), a.bbox))
+                        .collect()
+                }
+            }
+            None => vec![(None, [0.0, 0.0, img.w as f32, img.h as f32])],
+        };
+        let mut infos = vec![];
+        for (area, b) in parts {
+            let (dets, info) = if area.is_none() {
+                let raw = run_detector(&self.det, img, score, self.iou_threshold)?;
+                (raw.boxes, raw.info)
+            } else {
+                let (w, h, px) = crop(img, b);
+                if w < 8 || h < 8 {
+                    continue;
+                }
+                let sub = Rgba { w, h, px: &px };
+                let mut raw = run_detector(&self.det, &sub, score, self.iou_threshold)?;
+                for d in &mut raw.boxes {
+                    d.1 = [d.1[0] + b[0], d.1[1] + b[1], d.1[2] + b[0], d.1[3] + b[1]];
+                }
+                (raw.boxes, raw.info)
+            };
+            if infos.is_empty() {
+                infos.push(info);
+            }
+            for (sc, bbox, k) in dets {
+                let name = self
+                    .det
+                    .names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{k}"));
+                out.tiles.push(Detection {
+                    bbox,
+                    label: label_of(&name),
+                    name,
+                    score: sc,
+                    area: area.clone(),
+                });
+            }
+        }
+        // 領域が重なると同じ牌を2回見つけるので、まとめる
+        if self.regions.is_some() {
+            let v: Vec<(f32, [f32; 4], usize)> = out
+                .tiles
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (d.score, d.bbox, i))
+                .collect();
+            let keep = nms(v, self.iou_threshold);
+            let mut idx: Vec<usize> = keep.into_iter().map(|(_, _, i)| i).collect();
+            idx.sort();
+            out.tiles = idx.into_iter().map(|i| out.tiles[i].clone()).collect();
+        }
+        out.info += &format!("検出: {}", infos.join(""));
         if let Some(cls) = &self.cls {
             let pad = self.det.side.pad.or(cls.side.pad).unwrap_or(0.06);
-            for d in &mut dets {
+            for d in &mut out.tiles {
                 let (k, p) = classify(cls, img, d.bbox, pad)?;
                 d.name = cls.names.get(k).cloned().unwrap_or_else(|| format!("#{k}"));
                 d.label = label_of(&d.name);
                 d.score *= p;
             }
         }
-        Ok(dets)
+        Ok(out)
     }
+}
 
-    fn detect(&self, img: &Rgba) -> Result<Vec<Detection>, String> {
-        let m = &self.det;
-        // 縦横比を保って縮め、余りは灰色（114）で埋める（Ultralytics と同じ）
-        let r = (m.w as f32 / img.w as f32).min(m.h as f32 / img.h as f32);
-        let (nw, nh) = (img.w as f32 * r, img.h as f32 * r);
-        let (ox, oy) = ((m.w as f32 - nw) / 2.0, (m.h as f32 - nh) / 2.0);
-        let mut chw = vec![114.0 / 255.0; 3 * m.w * m.h];
-        let plane = m.w * m.h;
-        for y in 0..m.h {
-            let fy = y as f32 + 0.5 - oy;
-            if fy < 0.0 || fy >= nh {
+/// 検出（YOLO）を1回動かして、枠を画像の座標で返す
+fn run_detector(m: &Onnx, img: &Rgba, score: f32, iou: f32) -> Result<RawDet, String> {
+    // 縦横比を保って縮め、余りは灰色（114）で埋める（Ultralytics と同じ）
+    let r = (m.w as f32 / img.w as f32).min(m.h as f32 / img.h as f32);
+    let (nw, nh) = (img.w as f32 * r, img.h as f32 * r);
+    let (ox, oy) = ((m.w as f32 - nw) / 2.0, (m.h as f32 - nh) / 2.0);
+    let mut chw = vec![114.0 / 255.0; 3 * m.w * m.h];
+    let plane = m.w * m.h;
+    for y in 0..m.h {
+        let fy = y as f32 + 0.5 - oy;
+        if fy < 0.0 || fy >= nh {
+            continue;
+        }
+        for x in 0..m.w {
+            let fx = x as f32 + 0.5 - ox;
+            if fx < 0.0 || fx >= nw {
                 continue;
             }
-            for x in 0..m.w {
-                let fx = x as f32 + 0.5 - ox;
-                if fx < 0.0 || fx >= nw {
-                    continue;
-                }
-                let c = img.sample(fx / r - 0.5, fy / r - 0.5);
-                for k in 0..3 {
-                    chw[k * plane + y * m.w + x] = c[k] / 255.0;
-                }
+            let c = img.sample(fx / r - 0.5, fy / r - 0.5);
+            for k in 0..3 {
+                chw[k * plane + y * m.w + x] = c[k] / 255.0;
             }
         }
-        let out = m.run(chw)?;
-        let s = out.shape();
-        let nc = m.names.len();
-        // チャンネル（4+クラス数、セグメンテーションは +32）がどちらの次元か
-        let is_ch = |d: usize| nc > 0 && (d == 4 + nc || d == 4 + nc + 32);
-        let end2end = match m.side.format.as_deref() {
-            Some("end2end") => true,
-            Some(_) => false,
-            // [1, N, 6(+32)]: 1行 = 左上・右下・確信度・クラス
-            None => (s[2] == 6 || s[2] == 38) && !is_ch(s[1]) && !(is_ch(s[2]) && s[1] > s[2] * 4),
+    }
+    let out = m.run(chw)?;
+    let s = out.shape().to_vec();
+    let nc = m.names.len();
+    // チャンネル（4+クラス数、セグメンテーションは +32）がどちらの次元か
+    let is_ch = |d: usize| nc > 0 && (d == 4 + nc || d == 4 + nc + 32);
+    let end2end = match m.side.format.as_deref() {
+        Some("end2end") => true,
+        Some(_) => false,
+        // [1, N, 6(+32)]: 1行 = 枠4つ・確信度・クラス
+        None => (s[2] == 6 || s[2] == 38) && !is_ch(s[1]) && !(is_ch(s[2]) && s[1] > s[2] * 4),
+    };
+    // 候補（確信度, 枠の4つの数, クラス）
+    let mut cand: Vec<(f32, [f32; 4], usize)> = vec![];
+    let mut max_score = 0.0f32;
+    if end2end {
+        for i in 0..s[1] {
+            let sc = out[[0, i, 4]];
+            max_score = max_score.max(sc);
+            if sc >= score {
+                let b = [
+                    out[[0, i, 0]],
+                    out[[0, i, 1]],
+                    out[[0, i, 2]],
+                    out[[0, i, 3]],
+                ];
+                cand.push((sc, b, out[[0, i, 5]].max(0.0) as usize));
+            }
+        }
+    } else {
+        // [1, 4+nc(+32), N]。クラス数が分からなければ、セグメンテーションの 32 を引いた残り
+        let (ch, n, t) = if is_ch(s[1]) {
+            (s[1], s[2], false)
+        } else if is_ch(s[2]) || s[1] > s[2] {
+            (s[2], s[1], true)
+        } else {
+            (s[1], s[2], false)
         };
-        let mut boxes: Vec<(f32, [f32; 4], usize)> = vec![];
-        let unmap = |b: [f32; 4]| -> [f32; 4] {
-            [
+        let ncls = if nc > 0 && 4 + nc <= ch {
+            nc
+        } else if ch > 4 + 32 {
+            ch - 4 - 32
+        } else {
+            ch - 4
+        };
+        let at = |c: usize, i: usize| if t { out[[0, i, c]] } else { out[[0, c, i]] };
+        for i in 0..n {
+            let (mut best, mut k) = (0.0f32, 0usize);
+            for c in 0..ncls {
+                let v = at(4 + c, i);
+                if v > best {
+                    best = v;
+                    k = c;
+                }
+            }
+            max_score = max_score.max(best);
+            if best >= score {
+                cand.push((best, [at(0, i), at(1, i), at(2, i), at(3, i)], k));
+            }
+        }
+    }
+    // 枠の書き方を見分ける: v8 系は中心・幅・高さ。NMS なし（26 / v10）は左上・右下のはずだが、
+    // 右下が左上より小さい枠が多ければ中心・幅・高さとして読む
+    let cxcywh = if end2end {
+        let bad = cand
+            .iter()
+            .filter(|c| c.1[2] <= c.1[0] || c.1[3] <= c.1[1])
+            .count();
+        !cand.is_empty() && bad * 2 > cand.len()
+    } else {
+        true
+    };
+    // 0〜1 の割合で書いてあるモデルは、入力の大きさを掛ける
+    let normalized = !cand.is_empty()
+        && cand
+            .iter()
+            .all(|c| c.1.iter().all(|v| (-0.01..=1.5).contains(v)));
+    let mut boxes: Vec<(f32, [f32; 4], usize)> = cand
+        .iter()
+        .map(|(sc, b, k)| {
+            let mut b = *b;
+            if normalized {
+                b = [
+                    b[0] * m.w as f32,
+                    b[1] * m.h as f32,
+                    b[2] * m.w as f32,
+                    b[3] * m.h as f32,
+                ];
+            }
+            if cxcywh {
+                b = [
+                    b[0] - b[2] / 2.0,
+                    b[1] - b[3] / 2.0,
+                    b[0] + b[2] / 2.0,
+                    b[1] + b[3] / 2.0,
+                ];
+            }
+            let b = [
                 ((b[0] - ox) / r).clamp(0.0, img.w as f32),
                 ((b[1] - oy) / r).clamp(0.0, img.h as f32),
                 ((b[2] - ox) / r).clamp(0.0, img.w as f32),
                 ((b[3] - oy) / r).clamp(0.0, img.h as f32),
-            ]
-        };
+            ];
+            (*sc, b, *k)
+        })
+        .collect();
+    let before = boxes.len();
+    boxes.retain(|(_, b, _)| b[2] - b[0] >= 2.0 && b[3] - b[1] >= 2.0);
+    let small = before - boxes.len();
+    // NMS なしのモデルでも、念のため重なりはまとめる
+    let n_cand = boxes.len();
+    boxes = nms(boxes, iou);
+    let info = format!(
+        "出力 {:?}・{}・{}{}・候補 {}（小さすぎて捨てた {}・重なりでまとめた {}）・最高の確信度 {:.2}",
+        s,
         if end2end {
-            for i in 0..s[1] {
-                let sc = out[[0, i, 4]];
-                if sc >= self.score_threshold {
-                    let b = [
-                        out[[0, i, 0]],
-                        out[[0, i, 1]],
-                        out[[0, i, 2]],
-                        out[[0, i, 3]],
-                    ];
-                    boxes.push((sc, unmap(b), out[[0, i, 5]].max(0.0) as usize));
-                }
-            }
+            "NMSなし形式"
         } else {
-            // [1, 4+nc(+32), N]。クラス数が分からなければ、セグメンテーションの 32 を引いた残り
-            let (ch, n, t) = if is_ch(s[1]) {
-                (s[1], s[2], false)
-            } else if is_ch(s[2]) || s[1] > s[2] {
-                (s[2], s[1], true)
-            } else {
-                (s[1], s[2], false)
-            };
-            let ncls = if nc > 0 && 4 + nc <= ch {
-                nc
-            } else if ch > 4 + 32 {
-                ch - 4 - 32
-            } else {
-                ch - 4
-            };
-            let at = |c: usize, i: usize| if t { out[[0, i, c]] } else { out[[0, c, i]] };
-            for i in 0..n {
-                let (mut best, mut k) = (0.0f32, 0usize);
-                for c in 0..ncls {
-                    let v = at(4 + c, i);
-                    if v > best {
-                        best = v;
-                        k = c;
-                    }
-                }
-                if best >= self.score_threshold {
-                    let (cx, cy, w, h) = (at(0, i), at(1, i), at(2, i), at(3, i));
-                    let b = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0];
-                    boxes.push((best, unmap(b), k));
-                }
-            }
-            boxes = nms(boxes, self.iou_threshold);
-        }
-        Ok(boxes
-            .into_iter()
-            .filter(|(_, b, _)| b[2] - b[0] >= 2.0 && b[3] - b[1] >= 2.0)
-            .map(|(score, bbox, k)| {
-                let name = m.names.get(k).cloned().unwrap_or_else(|| format!("#{k}"));
-                Detection {
-                    bbox,
-                    label: label_of(&name),
-                    name,
-                    score,
-                }
-            })
-            .collect())
-    }
+            "v8形式"
+        },
+        if cxcywh {
+            "中心+幅高さ"
+        } else {
+            "左上+右下"
+        },
+        if normalized { "・割合" } else { "" },
+        cand.len(),
+        small,
+        n_cand - boxes.len(),
+        max_score
+    );
+    Ok(RawDet { boxes, info })
 }
 
 /// 重なった枠のうち、確信度の低いほうを捨てる（クラスに関係なく。牌は重ならないので）

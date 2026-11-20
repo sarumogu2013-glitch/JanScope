@@ -4,12 +4,12 @@
 //! サンドボックスの枠（手牌・河など）の切り出し画像で認識を試す。結果は枠と牌の名前を画像に重ねて出す。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bevy_egui::egui;
-use janscope_recog::{Detection, Label, Recognizer, Rgba, find_models};
+use janscope_recog::{Area, Detection, Found, Label, Recognizer, Rgba, find_models};
 use janscope_video::http;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,10 @@ pub struct RecogConfig {
     pub classifier: String,
     /// 試す枠（face-A・hand-A など）
     pub region: String,
+    /// 領域モデル（手牌・河・副露などの場所を見つける。空なら使わない）
+    pub regions: String,
+    /// 検出のしきい値（0 ならモデルの既定 0.25）
+    pub score: f32,
 }
 
 /// 実行ファイルの隣の models
@@ -54,6 +58,8 @@ struct Shot {
     h: usize,
     rgba: Vec<u8>,
     dets: Vec<Detection>,
+    areas: Vec<Area>,
+    info: String,
     ms: u128,
     seq: u64,
 }
@@ -77,7 +83,9 @@ pub struct RecogUi {
     seq: Arc<AtomicU64>,
     tex: Option<(u64, egui::TextureHandle)>,
     /// 見つけたモデル（検出, 分類）
-    found: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
+    found: Option<Found>,
+    /// 検出のしきい値（f32 のビット）
+    score: Arc<AtomicU32>,
     min_score: f32,
 }
 
@@ -115,6 +123,7 @@ impl RecogUi {
         let dir = cfg.dir_path();
         let det = dir.join(&cfg.detector);
         let cls = (!cfg.classifier.is_empty()).then(|| dir.join(&cfg.classifier));
+        let reg = (!cfg.regions.is_empty()).then(|| dir.join(&cfg.regions));
         let (model, status, loading) = (
             self.model.clone(),
             self.status.clone(),
@@ -123,7 +132,7 @@ impl RecogUi {
         *status.lock().unwrap() = "読み込んでいます…（大きいモデルは数十秒かかります）".into();
         std::thread::spawn(move || {
             let t = Instant::now();
-            match Recognizer::load(&det, cls.as_deref()) {
+            match Recognizer::load(&det, cls.as_deref(), reg.as_deref()) {
                 Ok(r) => {
                     *status.lock().unwrap() = format!(
                         "読み込みました（{:.1}秒）: {}",
@@ -148,6 +157,7 @@ impl RecogUi {
         }
         let stop = Arc::new(AtomicBool::new(false));
         self.worker = Some(stop.clone());
+        let score = self.score.clone();
         let (model, running, once, url, shot, error, seq) = (
             self.model.clone(),
             self.running.clone(),
@@ -174,16 +184,23 @@ impl RecogUi {
                     })
                     .and_then(|(w, h, px)| {
                         let t = Instant::now();
-                        let dets = m.recognize(&Rgba {
-                            w: w as usize,
-                            h: h as usize,
-                            px: &px,
-                        })?;
+                        let th = f32::from_bits(score.load(Ordering::SeqCst));
+                        let th = if th > 0.0 { th } else { m.default_score() };
+                        let res = m.recognize(
+                            &Rgba {
+                                w: w as usize,
+                                h: h as usize,
+                                px: &px,
+                            },
+                            th,
+                        )?;
                         Ok(Shot {
                             w: w as usize,
                             h: h as usize,
                             rgba: px,
-                            dets,
+                            dets: res.tiles,
+                            areas: res.areas,
+                            info: res.info,
                             ms: t.elapsed().as_millis(),
                             seq: seq.fetch_add(1, Ordering::SeqCst) + 1,
                         })
@@ -280,7 +297,8 @@ pub fn window(
                 }
             });
             let dir = rc.dir_path();
-            let (dets, clss) = r.found.get_or_insert_with(|| find_models(&dir)).clone();
+            let found = r.found.get_or_insert_with(|| find_models(&dir)).clone();
+            let (dets, clss, regs) = (found.detectors, found.classifiers, found.regions);
             if dets.is_empty() {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 200, 80),
@@ -326,6 +344,26 @@ pub fn window(
                             changed |= ui.selectable_value(&mut rc.classifier, n.clone(), n).changed();
                         }
                     });
+                ui.end_row();
+                ui.label("領域モデル");
+                egui::ComboBox::from_id_salt("recog_reg")
+                    .width(300.0)
+                    .selected_text(if rc.regions.is_empty() {
+                        "使わない（枠の画像全体で牌を探す）".into()
+                    } else {
+                        rc.regions.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut rc.regions, String::new(), "使わない（枠の画像全体で牌を探す）")
+                            .changed();
+                        for p in &regs {
+                            let n = file_name(p);
+                            changed |= ui.selectable_value(&mut rc.regions, n.clone(), n).changed();
+                        }
+                    })
+                    .response
+                    .on_hover_text("手牌・河・副露などの場所を見つけるモデル（regions-yolo など）。卓全体の枠で使うと、場所ごとに牌を探して、どこの牌かも出します");
                 ui.end_row();
             });
             ui.horizontal(|ui| {
@@ -377,6 +415,18 @@ pub fn window(
                     }
                     ui.add(egui::Slider::new(&mut r.min_score, 0.0..=1.0).text("赤にする確信度"));
                 });
+                ui.horizontal(|ui| {
+                    let mut th = if rc.score > 0.0 { rc.score } else { 0.25 };
+                    if ui
+                        .add(egui::Slider::new(&mut th, 0.01..=0.9).text("検出のしきい値"))
+                        .on_hover_text("下げると、自信の低い牌も拾います（見つからない牌があるときは下げる）")
+                        .changed()
+                    {
+                        rc.score = th;
+                        changed = true;
+                    }
+                    r.score.store(th.to_bits(), Ordering::SeqCst);
+                });
                 *r.url.lock().unwrap() = format!("{}/region/{}.jpg", base.trim_end_matches('/'), rc.region);
             }
             if let Some(e) = r.error.lock().unwrap().clone() {
@@ -397,12 +447,25 @@ pub fn window(
                         }
                     }
                 }
-                let mut sorted: Vec<&Detection> = s.dets.iter().collect();
-                sorted.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
                 ui.label(format!("{} 枚（{} ms）", s.dets.len(), s.ms));
+                ui.label(egui::RichText::new(&s.info).weak().small())
+                    .on_hover_text("モデルの出力の様子。見つからない牌があるときの手がかりになります");
+                // 場所（領域）ごとに、左から並べる
+                let mut groups: Vec<(Option<String>, Vec<&Detection>)> = vec![];
+                for d in &s.dets {
+                    match groups.iter_mut().find(|(a, _)| *a == d.area) {
+                        Some((_, v)) => v.push(d),
+                        None => groups.push((d.area.clone(), vec![d])),
+                    }
+                }
+                for (area, v) in &mut groups {
+                    v.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("左から:");
-                    for d in &sorted {
+                    ui.label(match area {
+                        Some(a) => format!("{a}（左から）:"),
+                        None => "左から:".into(),
+                    });
+                    for d in v.iter() {
                         let t = label_text(d.label, &d.name);
                         let c = if d.score < r.min_score {
                             egui::Color32::from_rgb(255, 110, 110)
@@ -412,6 +475,7 @@ pub fn window(
                         ui.colored_label(c, t).on_hover_text(format!("{}（{:.2}）", d.name, d.score));
                     }
                 });
+                }
                 if let Some((_, t)) = &r.tex {
                     let avail = ui.available_size();
                     let sc = (avail.x / s.w as f32).min((avail.y.max(200.0)) / s.h as f32).min(2.0);
@@ -424,6 +488,22 @@ pub fn window(
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+                    // 領域（手牌・河など）
+                    for a in &s.areas {
+                        let b = egui::Rect::from_min_max(
+                            rect.min + egui::vec2(a.bbox[0] * sc, a.bbox[1] * sc),
+                            rect.min + egui::vec2(a.bbox[2] * sc, a.bbox[3] * sc),
+                        );
+                        let c = egui::Color32::from_rgb(90, 160, 255);
+                        p.rect_stroke(b, 0.0, egui::Stroke::new(2.0, c), egui::StrokeKind::Inside);
+                        p.text(
+                            b.left_bottom() + egui::vec2(2.0, -2.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{} {:.2}", a.name, a.score),
+                            egui::FontId::proportional(13.0),
+                            c,
+                        );
+                    }
                     for d in &s.dets {
                         let c = if d.score < r.min_score {
                             egui::Color32::from_rgb(255, 80, 80)
